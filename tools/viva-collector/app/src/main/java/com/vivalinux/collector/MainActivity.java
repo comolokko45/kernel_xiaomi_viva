@@ -41,6 +41,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 public class MainActivity extends Activity {
+    private static final String VERSION = "0.2.0";
     private TextView status;
     private volatile boolean busy = false;
 
@@ -54,27 +55,28 @@ public class MainActivity extends Activity {
         root.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("Viva Linux Collector v0.1\nREAD-ONLY / ROOT-AWARE");
+        title.setText("Viva Linux Collector v" + VERSION + "\nREAD-ONLY / ROOT + NON-ROOT FALLBACK");
         title.setTextSize(22);
         root.addView(title);
 
         TextView desc = new TextView(this);
         desc.setText("Target: Xiaomi Redmi Note 11 Pro 4G (viva / MT6781). " +
                 "A=ROM+hardware, B=boot+AVB+kernel, C=Wi-Fi+SSH. " +
-                "No flash/erase/mount-rw/setprop/reboot commands exist in this build.");
+                "Root varsa geniş toplama; yoksa otomatik sınırlı non-root toplama. " +
+                "Flash/erase/mount-rw/setprop/reboot/slot-write yok.");
         desc.setPadding(0, dp(8), 0, dp(8));
         root.addView(desc);
 
-        addButton(root, "1) Root kontrol", v -> runRootCheck());
+        addButton(root, "1) Yetki / root kontrol", v -> runRootCheck());
         addButton(root, "2) CORE topla", v -> collect(Arrays.asList(Profile.CORE)));
         addButton(root, "3) Branch A verileri", v -> collect(Arrays.asList(Profile.CORE, Profile.A)));
         addButton(root, "4) Branch B verileri", v -> collect(Arrays.asList(Profile.CORE, Profile.B)));
         addButton(root, "5) Branch C verileri", v -> collect(Arrays.asList(Profile.CORE, Profile.C)));
         addButton(root, "6) TÜMÜNÜ TOPLA (CORE+A+B+C)", v -> collect(Arrays.asList(Profile.CORE, Profile.A, Profile.B, Profile.C)));
-        addButton(root, "7) Boot-chain SHA-256 (salt-okunur)", v -> collect(Arrays.asList(Profile.CORE, Profile.HASHES)));
+        addButton(root, "7) Boot-chain SHA-256 (root gerekebilir)", v -> collect(Arrays.asList(Profile.CORE, Profile.HASHES)));
 
         status = new TextView(this);
-        status.setText("Hazır. Root kontrolüyle başlayın.");
+        status.setText("Hazır. Önce yetki/root kontrolü önerilir.");
         status.setTextIsSelectable(true);
         status.setMovementMethod(new ScrollingMovementMethod());
         status.setPadding(0, dp(12), 0, dp(32));
@@ -110,11 +112,13 @@ public class MainActivity extends Activity {
     private void runRootCheck() {
         if (busy) return;
         busy = true;
-        setStatus("Root kontrol ediliyor...");
+        setStatus("Yetki kontrol ediliyor...");
         new Thread(() -> {
-            CommandResult r = RootShell.run("id; echo SELINUX=$(getenforce 2>/dev/null || echo unknown)", 10, 128 * 1024);
+            boolean rooted = Shell.hasRoot();
+            CommandResult r = Shell.run("id; echo SELINUX=$(getenforce 2>/dev/null || echo unknown)", rooted, 10, 128 * 1024);
+            log("mode=" + (rooted ? "ROOT" : "NON_ROOT"));
             log("exit=" + r.exitCode + "\n" + Redactor.clean(r.output));
-            log(r.exitCode == 0 && r.output.contains("uid=0") ? "ROOT: OK" : "ROOT: YOK / su izni verilmedi");
+            log(rooted ? "ROOT: OK" : "ROOT: YOK — collector sınırlı non-root modunda çalışabilir.");
             busy = false;
         }).start();
     }
@@ -122,24 +126,26 @@ public class MainActivity extends Activity {
     private void collect(List<Profile> profiles) {
         if (busy) return;
         busy = true;
-        setStatus("Toplama başlatıldı: " + profiles + "\nRoot isteği gelirse ONAYLAYIN.");
+        setStatus("Toplama başlatıldı: " + profiles + "\nRoot isteği gelirse izin verebilirsiniz; reddedilirse non-root devam eder.");
 
         new Thread(() -> {
             File workDir = null;
             try {
-                CommandResult rootCheck = RootShell.run("id", 10, 64 * 1024);
-                boolean rooted = rootCheck.exitCode == 0 && rootCheck.output.contains("uid=0");
-                log("Root: " + (rooted ? "OK" : "YOK"));
+                boolean rooted = Shell.hasRoot();
+                String executionMode = rooted ? "ROOT" : "NON_ROOT";
+                log("Çalışma modu: " + executionMode);
 
                 String stamp = utcStamp();
                 workDir = new File(getCacheDir(), "VIVA_COLLECT_" + stamp);
                 if (!workDir.mkdirs() && !workDir.isDirectory()) throw new Exception("workdir oluşturulamadı");
 
                 JSONObject manifest = new JSONObject();
-                manifest.put("schema", "viva-linux-collector/1");
-                manifest.put("collector_version", "0.1.0");
+                manifest.put("schema", "viva-linux-collector/2");
+                manifest.put("collector_version", VERSION);
                 manifest.put("created_utc", isoUtc());
                 manifest.put("root_available", rooted);
+                manifest.put("execution_mode", executionMode);
+                manifest.put("non_root_fallback", true);
                 manifest.put("read_only_policy", true);
                 manifest.put("target_device", "Xiaomi Redmi Note 11 Pro 4G");
                 manifest.put("target_codename", "viva");
@@ -147,6 +153,10 @@ public class MainActivity extends Activity {
                 manifest.put("expected_physical_baseline", "viva_tr / OS1.0.1.0.TGDTRXM / Android 13 package");
                 manifest.put("expected_stock_kernel_baseline", "4.14.186-perf-g565ad7461fab");
                 manifest.put("expected_wifi_reference", "MT6631 / CONSYS_6781 / wlan0 / gen4m");
+
+                String serialHash = RuntimeProbe.serialSha256(rooted);
+                if (!serialHash.isEmpty()) manifest.put("device_serial_sha256", serialHash);
+                else manifest.put("device_serial_sha256", JSONObject.NULL);
 
                 JSONArray profileArray = new JSONArray();
                 for (Profile pp : profiles) profileArray.put(pp.name());
@@ -159,10 +169,10 @@ public class MainActivity extends Activity {
                     log("== " + p + " ==");
                     for (CollectorItem item : CollectorCatalog.items(p)) {
                         log("• " + item.name);
-                        CommandResult r = RootShell.run(item.command, item.timeoutSeconds, item.maxBytes);
+                        CommandResult r = Shell.run(item.command, rooted, item.timeoutSeconds, item.maxBytes);
                         String body = "# name: " + item.name + "\n" +
                                 "# command_id: " + item.id + "\n" +
-                                "# root: " + rooted + "\n" +
+                                "# execution_mode: " + executionMode + "\n" +
                                 "# exit_code: " + r.exitCode + "\n" +
                                 "# timed_out: " + r.timedOut + "\n" +
                                 "# truncated: " + r.truncated + "\n\n" +
@@ -174,6 +184,7 @@ public class MainActivity extends Activity {
                         rec.put("profile", p.name());
                         rec.put("id", item.id);
                         rec.put("name", item.name);
+                        rec.put("execution_mode", executionMode);
                         rec.put("exit_code", r.exitCode);
                         rec.put("timed_out", r.timedOut);
                         rec.put("truncated", r.truncated);
@@ -183,7 +194,7 @@ public class MainActivity extends Activity {
                     }
                 }
 
-                manifest.put("runtime_summary", RuntimeProbe.summarize());
+                manifest.put("runtime_summary", RuntimeProbe.summarize(rooted));
                 manifest.put("records", records);
                 writeUtf8(new File(workDir, "manifest.json"), manifest.toString(2));
 
@@ -194,6 +205,7 @@ public class MainActivity extends Activity {
                 log("\nTAMAMLANDI");
                 log("ZIP SHA-256: " + sha256(zip));
                 log("Kayıt: " + exported);
+                if (!rooted) log("NOT: Non-root modunda root/SELinux gerektiren bazı kanıtlar erişilemez olabilir.");
                 log("Bu ZIP'i A/B/C analizine doğrudan verebilirsiniz.");
             } catch (Throwable t) {
                 log("HATA: " + t.getClass().getSimpleName() + ": " + t.getMessage());
@@ -271,8 +283,22 @@ public class MainActivity extends Activity {
             int n;
             while ((n = in.read(buf)) >= 0) md.update(buf, 0, n);
         }
+        return hex(md.digest());
+    }
+
+    private static String sha256Text(String value) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            md.update(value.getBytes(StandardCharsets.UTF_8));
+            return hex(md.digest());
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String hex(byte[] bytes) {
         StringBuilder sb = new StringBuilder();
-        for (byte b : md.digest()) sb.append(String.format(Locale.US, "%02x", b));
+        for (byte b : bytes) sb.append(String.format(Locale.US, "%02x", b));
         return sb.toString();
     }
 
@@ -323,6 +349,7 @@ public class MainActivity extends Activity {
                 x.add(i("identity", "Android/device identity", "getprop; echo '--- uname ---'; uname -a; echo '--- id ---'; id; echo '--- selinux ---'; getenforce 2>/dev/null || true", 15, 2));
                 x.add(i("cpu_mem", "CPU + RAM", "cat /proc/cpuinfo 2>/dev/null; echo '--- MEM ---'; cat /proc/meminfo 2>/dev/null", 10, 2));
                 x.add(i("kernel_cmdline", "Kernel cmdline + bootconfig", "cat /proc/cmdline 2>/dev/null; echo '--- BOOTCONFIG ---'; cat /proc/bootconfig 2>/dev/null || true; echo '--- VERSION ---'; cat /proc/version 2>/dev/null", 10, 2));
+                x.add(i("boot_reason", "Boot reason properties", "echo ro.boot.bootreason=$(getprop ro.boot.bootreason); echo sys.boot.reason=$(getprop sys.boot.reason); echo persist.sys.boot.reason=$(getprop persist.sys.boot.reason); echo ro.boot.bootreason.last=$(getprop ro.boot.bootreason.last)", 10, 1));
                 x.add(i("mounts", "Mount/filesystem map", "mount 2>/dev/null; echo '--- proc mounts ---'; cat /proc/mounts 2>/dev/null; echo '--- filesystems ---'; cat /proc/filesystems 2>/dev/null; echo '--- df ---'; df -hT 2>/dev/null || df -h 2>/dev/null", 15, 4));
                 x.add(i("block_map", "Block + partition map", "cat /proc/partitions 2>/dev/null; echo '--- by-name ---'; ls -la /dev/block/by-name 2>/dev/null || true; echo '--- mapper ---'; ls -la /dev/block/mapper 2>/dev/null || true; echo '--- sys block ---'; ls -la /sys/class/block 2>/dev/null", 15, 4));
             } else if (p == Profile.A) {
@@ -333,8 +360,10 @@ public class MainActivity extends Activity {
                 x.add(i("camera", "Camera service inventory", "dumpsys media.camera 2>/dev/null || dumpsys media.camera.proxy 2>/dev/null || true", 25, 6));
                 x.add(i("firmware_index", "Firmware index relevant to MTK/WCN", "find /vendor/firmware /vendor/etc/firmware /odm/firmware /lib/firmware -maxdepth 3 -type f 2>/dev/null | grep -Ei 'wifi|wlan|wmt|conn|mt66|mt67|scp|sspm|ufs' | sort | head -n 3000", 30, 8));
             } else if (p == Profile.B) {
-                x.add(i("verified_boot", "AVB / lock / slot state", "getprop ro.boot.slot_suffix; getprop ro.boot.slot; getprop ro.boot.verifiedbootstate; getprop ro.boot.vbmeta.device_state; getprop ro.boot.flash.locked; getprop ro.boot.veritymode; getprop ro.boot.avb_version; echo '--- avbctl ---'; avbctl get-verity 2>/dev/null || true; avbctl get-verification 2>/dev/null || true; echo '--- bootctl ---'; bootctl get-current-slot 2>/dev/null || true; bootctl hal-info 2>/dev/null || true", 15, 2));
+                x.add(i("verified_boot", "AVB / lock / basic slot state", "getprop ro.boot.slot_suffix; getprop ro.boot.slot; getprop ro.boot.verifiedbootstate; getprop ro.boot.vbmeta.device_state; getprop ro.boot.flash.locked; getprop ro.boot.veritymode; getprop ro.boot.avb_version; echo '--- avbctl ---'; avbctl get-verity 2>/dev/null || true; avbctl get-verification 2>/dev/null || true; echo '--- bootctl ---'; bootctl get-current-slot 2>/dev/null || true; bootctl hal-info 2>/dev/null || true", 15, 2));
+                x.add(i("slot_state", "Detailed A/B slot state (read-only)", "echo number_slots=$(bootctl get-number-slots 2>/dev/null || true); echo current_slot=$(bootctl get-current-slot 2>/dev/null || true); for s in 0 1; do echo ===slot_$s===; bootctl is-slot-bootable $s 2>/dev/null; echo bootable_exit=$?; bootctl is-slot-marked-successful $s 2>/dev/null; echo successful_exit=$?; done", 15, 2));
                 x.add(i("boot_partitions", "Boot-chain partition symlinks/sizes", "for n in boot_a boot_b vendor_boot_a vendor_boot_b init_boot_a init_boot_b dtbo_a dtbo_b vbmeta_a vbmeta_b vbmeta_system_a vbmeta_system_b vbmeta_vendor_a vbmeta_vendor_b lk_a lk_b; do p=/dev/block/by-name/$n; if [ -e \"$p\" ]; then echo ===$n===; readlink -f \"$p\"; blockdev --getsize64 \"$p\" 2>/dev/null || true; fi; done", 20, 2));
+                x.add(i("boot_history", "pstore + last_kmsg boot/crash evidence", "echo '--- pstore listing ---'; ls -la /sys/fs/pstore 2>/dev/null || true; echo '--- pstore files ---'; for f in /sys/fs/pstore/*; do [ -f \"$f\" ] && { echo ===$f===; cat \"$f\" 2>/dev/null; }; done; echo '--- last_kmsg ---'; cat /proc/last_kmsg 2>/dev/null || true", 35, 12));
                 x.add(i("fstab", "fstab/first-stage mount configs", "for f in /vendor/etc/fstab* /odm/etc/fstab* /system/etc/fstab* /system/system/etc/fstab*; do [ -f \"$f\" ] && { echo ===$f===; cat \"$f\"; }; done", 15, 4));
                 x.add(i("init_services", "Init services", "getprop | grep '^\\[init.svc' | sort; echo '--- processes ---'; ps -A -o USER,PID,PPID,NAME,ARGS 2>/dev/null || ps -A 2>/dev/null", 20, 6));
                 x.add(i("kernel_modules", "Kernel modules", "cat /proc/modules 2>/dev/null || true; echo '--- module dirs ---'; find /vendor/lib/modules /odm/lib/modules /lib/modules -maxdepth 2 -type f 2>/dev/null | sort | head -n 4000", 25, 8));
@@ -343,13 +372,15 @@ public class MainActivity extends Activity {
             } else if (p == Profile.C) {
                 x.add(i("wifi_props", "Wi-Fi/WMT properties", "getprop | grep -Ei 'wifi|wlan|wmt|conn|dhcp|net\\.' | sort", 15, 4));
                 x.add(i("wifi_interfaces", "Wi-Fi interfaces/phy", "ip -details link 2>/dev/null || ip link 2>/dev/null; echo '--- addr ---'; ip addr 2>/dev/null; echo '--- iw dev ---'; iw dev 2>/dev/null || true; echo '--- iw phy ---'; iw phy 2>/dev/null || true", 25, 8));
+                x.add(i("wifi_driver", "wlan0 driver / modalias / firmware links", "echo '--- wlan0 device ---'; readlink -f /sys/class/net/wlan0/device 2>/dev/null || true; echo '--- driver ---'; readlink -f /sys/class/net/wlan0/device/driver 2>/dev/null || true; echo '--- driver module ---'; readlink -f /sys/class/net/wlan0/device/driver/module 2>/dev/null || true; echo '--- modalias ---'; cat /sys/class/net/wlan0/device/modalias 2>/dev/null || true; echo '--- uevent ---'; cat /sys/class/net/wlan0/device/uevent 2>/dev/null || true; echo '--- ethtool ---'; ethtool -i wlan0 2>/dev/null || true; echo '--- firmware-ish links ---'; find /sys/class/net/wlan0/device -maxdepth 3 -type l -o -type f 2>/dev/null | grep -Ei 'firmware|driver|module|modalias|uevent' | head -n 500", 20, 4));
                 x.add(i("routing", "IP routes/rules", "ip route show table all 2>/dev/null; echo '--- rules ---'; ip rule 2>/dev/null; echo '--- neigh ---'; ip neigh 2>/dev/null", 15, 4));
                 x.add(i("wifi_dumpsys", "Android Wi-Fi service", "dumpsys wifi 2>/dev/null || true", 35, 12));
                 x.add(i("connectivity", "Connectivity/netd", "dumpsys connectivity 2>/dev/null || true; echo '--- netd ---'; dumpsys netd 2>/dev/null || true", 35, 12));
                 x.add(i("wmt_nodes", "MediaTek WMT/CONSYS nodes", "ls -la /dev 2>/dev/null | grep -Ei 'wmt|stp|wifi|wlan|conn' || true; echo '--- proc modules ---'; cat /proc/modules 2>/dev/null | grep -Ei 'wlan|wifi|wmt|stp|conn|bt' || true; echo '--- sys matches ---'; find /sys -maxdepth 6 2>/dev/null | grep -Ei '/(wlan|wifi|wmt|consys|connectivity)' | head -n 3000", 30, 8));
+                x.add(i("wmt_runtime_log", "MTK Wi-Fi/WMT focused kernel log", "dmesg 2>/dev/null | grep -Ei 'wmt|wlan|wifi|consys|mt6631|firmware|stp|conninfra' || true", 25, 8));
                 x.add(i("ssh_ports", "SSH/listening services", "ss -lntup 2>/dev/null || netstat -lntup 2>/dev/null || true; echo '--- ssh processes ---'; ps -A 2>/dev/null | grep -Ei 'dropbear|sshd' || true; echo '--- init ssh ---'; getprop | grep -Ei 'init.svc.*(dropbear|sshd)' || true", 15, 4));
             } else if (p == Profile.HASHES) {
-                x.add(i("boot_sha256", "Critical boot-chain SHA-256", "for n in boot_a boot_b vendor_boot_a vendor_boot_b init_boot_a init_boot_b dtbo_a dtbo_b vbmeta_a vbmeta_b vbmeta_system_a vbmeta_system_b vbmeta_vendor_a vbmeta_vendor_b lk_a lk_b; do p=/dev/block/by-name/$n; if [ -r \"$p\" ]; then echo ===$n===; sha256sum \"$p\"; fi; done", 180, 4));
+                x.add(i("boot_sha256", "Critical boot-chain SHA-256", "for n in boot_a boot_b vendor_boot_a vendor_boot_b init_boot_a init_boot_b dtbo_a dtbo_b vbmeta_a vbmeta_b vbmeta_system_a vbmeta_system_b vbmeta_vendor_a vbmeta_vendor_b lk_a lk_b; do p=/dev/block/by-name/$n; if [ -r \"$p\" ]; then echo ===$n===; sha256sum \"$p\"; else echo ===$n===; echo UNREADABLE_OR_MISSING; fi; done", 180, 4));
             }
             return x;
         }
@@ -366,12 +397,24 @@ public class MainActivity extends Activity {
         boolean truncated;
     }
 
-    static class RootShell {
-        static CommandResult run(String command, int timeoutSeconds, int maxBytes) {
+    static class Shell {
+        static boolean hasRoot() {
+            CommandResult r = runInternal(new String[]{"su", "-c", "id"}, 10, 64 * 1024);
+            return r.exitCode == 0 && r.output.contains("uid=0");
+        }
+
+        static CommandResult run(String command, boolean rooted, int timeoutSeconds, int maxBytes) {
+            String[] argv = rooted
+                    ? new String[]{"su", "-c", command}
+                    : new String[]{"sh", "-c", command};
+            return runInternal(argv, timeoutSeconds, maxBytes);
+        }
+
+        private static CommandResult runInternal(String[] argv, int timeoutSeconds, int maxBytes) {
             CommandResult r = new CommandResult();
             Process p = null;
             try {
-                p = new ProcessBuilder("su", "-c", command).redirectErrorStream(true).start();
+                p = new ProcessBuilder(argv).redirectErrorStream(true).start();
                 ByteArrayOutputStream out = new ByteArrayOutputStream(Math.min(maxBytes, 64 * 1024));
                 InputStream in = p.getInputStream();
                 byte[] buf = new byte[8192];
@@ -447,10 +490,10 @@ public class MainActivity extends Activity {
     }
 
     static class RuntimeProbe {
-        static JSONObject summarize() {
+        static JSONObject summarize(boolean rooted) {
             JSONObject o = new JSONObject();
             try {
-                String props = RootShell.run("getprop ro.product.device; getprop ro.board.platform; getprop ro.build.version.release; getprop ro.build.fingerprint; getprop ro.boot.verifiedbootstate; getprop ro.boot.vbmeta.device_state; getprop ro.boot.slot_suffix", 10, 256 * 1024).output;
+                String props = Shell.run("getprop ro.product.device; getprop ro.board.platform; getprop ro.build.version.release; getprop ro.build.fingerprint; getprop ro.boot.verifiedbootstate; getprop ro.boot.vbmeta.device_state; getprop ro.boot.slot_suffix; getprop ro.boot.bootreason; getprop sys.boot.reason", rooted, 10, 256 * 1024).output;
                 String[] a = props.split("\\r?\\n", -1);
                 o.put("ro.product.device", val(a, 0));
                 o.put("ro.board.platform", val(a, 1));
@@ -459,10 +502,23 @@ public class MainActivity extends Activity {
                 o.put("verifiedbootstate", val(a, 4));
                 o.put("vbmeta_device_state", val(a, 5));
                 o.put("slot_suffix", val(a, 6));
+                o.put("ro.boot.bootreason", val(a, 7));
+                o.put("sys.boot.reason", val(a, 8));
                 o.put("viva_match", "viva".equalsIgnoreCase(val(a, 0)));
             } catch (Throwable ignored) {
             }
             return o;
+        }
+
+        static String serialSha256(boolean rooted) {
+            try {
+                CommandResult r = Shell.run("getprop ro.serialno", rooted, 8, 64 * 1024);
+                String serial = r.output == null ? "" : r.output.trim();
+                if (serial.isEmpty() || serial.contains("Permission denied") || serial.contains("not found")) return "";
+                return sha256Text(serial);
+            } catch (Throwable t) {
+                return "";
+            }
         }
 
         static String val(String[] a, int i) {

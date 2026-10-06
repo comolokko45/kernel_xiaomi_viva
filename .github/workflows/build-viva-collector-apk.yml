@@ -1,0 +1,35 @@
+name: Build Viva Linux Collector APK
+
+on:
+  push:
+    branches:
+      - viva-collector-v01-20261006
+    paths:
+      - 'tools/viva-collector/**'
+      - '.github/workflows/build-viva-collector-apk.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            tools/viva-collector
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Build debug APK
+        working-directory: tools/viva-collector
+        run: gradle :app:assembleDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viva-linux-collector-debug
+          path: tools/viva-collector/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
